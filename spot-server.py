@@ -4,7 +4,7 @@ spot-server — Backend binario SP para Alpine.
 Protocolo binario, almacenamiento persistente, sin dependencias.
 Puerto TCP 1801.
 """
-import json, os, struct, time, uuid, socket, select, sys, threading
+import json, os, struct, time, uuid, socket, select, sys, threading, logging
 from pathlib import Path
 
 # ─── Protocolo ───────────────────────────────────────────────
@@ -16,6 +16,8 @@ MT = {
     "PING": 0x30, "PONG": 0x31, "ERROR": 0x40, "BYE": 0xFF,
 }
 F_REQ, F_RSP, F_ERR = 1, 2, 4
+MAX_SESSIONS = 128
+SESSION_TTL = 86400
 
 K = {"PATH":1,"ACTION":2,"DATA":4,"ID":5,"TOKEN":6,"VERSION":7,"STATUS":8,
      "MESSAGE":9,"COUNT":10,"NAME":12,"TITLE":0x0E,"USERNAME":0x12,"PASSWORD":0x13}
@@ -24,9 +26,11 @@ K_R = {v:k for k,v in K.items()}
 def enc_val(v):
     if isinstance(v, bool): return (9, bytes([1 if v else 0]))
     if isinstance(v, int):
-        if v < 256: return (1, bytes([v]))
-        if v < 65536: return (2, struct.pack(">H", v))
-        return (3, struct.pack(">I", v))
+        if v >= 0:
+            if v < 256: return (1, bytes([v]))
+            if v < 65536: return (2, struct.pack(">H", v))
+            return (3, struct.pack(">I", v))
+        return (3, struct.pack(">i", v))  # signed
     if isinstance(v, str):
         d = v.encode()
         return (5, struct.pack(">H", len(d)) + d)
@@ -42,14 +46,19 @@ def enc_val(v):
         p = b""; n = len(v)
         for i in v: td,dv = enc_val(i); p += bytes([td]) + dv
         return (10, struct.pack(">H", n) + p)
+    if isinstance(v, float):
+        return (8, struct.pack(">d", v))
     return (5, struct.pack(">H", 0))
 
 def dec_val(t, d, o):
     if t == 1: return (d[o], o+1)
     if t == 2: return (struct.unpack(">H", d[o:o+2])[0], o+2)
-    if t == 3: return (struct.unpack(">I", d[o:o+4])[0], o+4)
+    if t == 3:
+        if len(d) - o >= 4: return (struct.unpack(">I", d[o:o+4])[0], o+4)
+        return (0, o+1)
     if t == 5:
-        l = struct.unpack(">H", d[o:o+2])[0]; return (d[o+2:o+2+l].decode(), o+2+l)
+        l = struct.unpack(">H", d[o:o+2])[0]; return (d[o+2:o+2+l].decode("utf-8","replace"), o+2+l)
+    if t == 8: return (struct.unpack(">d", d[o:o+8])[0], o+8)
     if t == 9: return (bool(d[o]), o+1)
     if t == 10:
         c = struct.unpack(">H", d[o:o+2])[0]; o += 2; r = []
@@ -78,6 +87,7 @@ def mkframe(t, f, p=None):
 def prs(d):
     if len(d) < 6 or d[:2] != MAGIC: raise ValueError("bad frame")
     l = struct.unpack(">H", d[2:4])[0]
+    if len(d) < l: raise ValueError("truncated")
     t, f, p = d[4], d[5], {}
     if l > 6:
         pd = d[6:l]; c = struct.unpack(">H", pd[:2])[0]; o = 2
@@ -93,7 +103,7 @@ def prs(d):
 class SpotServer:
     def __init__(self, host="0.0.0.0", port=1801):
         self.host, self.port = host, port
-        self.sessions, self._data = {}, {}
+        self.sessions = {}
         self._dir = Path(__file__).parent / "data"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._start = time.time()
@@ -104,17 +114,24 @@ class SpotServer:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.host, self.port)); s.listen(10); s.setblocking(False)
-        print(f"spot-server :{self.port}")
+        sys.stderr.write(f"spot-server :{self.port}\n")
         while self._run:
             r,_,_ = select.select([s], [], [], 0.5)
             if r:
                 try:
                     c, a = s.accept()
-                    threading.Thread(target=self._h, args=(c,a), daemon=True).start()
-                except: pass
+                    t = threading.Thread(target=self._h, args=(c,a), daemon=True)
+                    t.start()
+                except OSError as e:
+                    sys.stderr.write(f"accept error: {e}\n")
         s.close()
 
     def stop(self): self._run = False
+
+    def _cleanup_sessions(self):
+        now = time.time()
+        expired = [s for s, v in self.sessions.items() if v["exp"] < now]
+        for s in expired: del self.sessions[s]
 
     def _h(self, c, a):
         b, sid = b"", None
@@ -123,38 +140,65 @@ class SpotServer:
             while self._run:
                 try: d = c.recv(4096)
                 except socket.timeout:
-                    if sid: c.sendall(mkframe(MT["PING"], F_REQ))
+                    if sid:
+                        try: c.sendall(mkframe(MT["PING"], F_REQ))
+                        except: break
                     continue
                 if not d: break
                 b += d
                 while len(b) >= 6:
                     if b[:2] != MAGIC: b = b[1:]; continue
+                    if len(b) < 6: break
                     l = struct.unpack(">H", b[2:4])[0]
                     if len(b) < l: break
-                    t,f,p,_ = prs(b[:l]); b = b[l:]
+                    try:
+                        t,f,p,_ = prs(b[:l])
+                    except ValueError:
+                        b = b[1:]; continue
+                    b = b[l:]
+
+                    if t == MT["PONG"]: continue
+                    if t == MT["PING"]:
+                        try: c.sendall(mkframe(MT["PONG"], F_RSP, {}))
+                        except: break
+                        continue
+
                     r = self._p(t, f, p, sid)
                     if r:
-                        if t == MT["HANDSHAKE"] and r[1] == F_RSP: sid = r[2].get("TOKEN")
-                        c.sendall(r[0])
+                        if t == MT["HANDSHAKE"] and r[1] == F_RSP:
+                            sid = r[2].get("TOKEN")
+                        try: c.sendall(r[0])
+                        except: break
                         if t == MT["BYE"]: return
-        except: pass
+        except Exception as e:
+            sys.stderr.write(f"client error: {e}\n")
         finally:
             if sid and sid in self.sessions: del self.sessions[sid]
-            c.close()
+            try: c.close()
+            except: pass
 
     def _p(self, t, f, p, sid):
         if t == MT["HANDSHAKE"]:
+            self._cleanup_sessions()
+            if len(self.sessions) >= MAX_SESSIONS:
+                return (mkframe(MT["HANDSHAKE_ERR"], F_RSP|F_ERR,
+                    {"MESSAGE": "max sessions reached"}), F_RSP|F_ERR, {})
             tok = uuid.uuid4().hex
-            self.sessions[tok] = {"exp": time.time() + 86400}
-            return (mkframe(MT["HANDSHAKE_OK"], F_RSP, {"TOKEN": tok, "STATUS": 0}), F_RSP, {"TOKEN": tok})
+            self.sessions[tok] = {"exp": time.time() + SESSION_TTL}
+            return (mkframe(MT["HANDSHAKE_OK"], F_RSP,
+                {"TOKEN": tok, "STATUS": 0}), F_RSP, {"TOKEN": tok})
+
         if t == MT["BYE"]:
             if sid and sid in self.sessions: del self.sessions[sid]
             return (mkframe(MT["BYE"], F_RSP, {"STATUS": 0}), F_RSP, {})
+
         if not sid or sid not in self.sessions:
-            return (mkframe(MT["ERROR"], F_RSP|F_ERR, {"STATUS": 401, "MESSAGE": "no auth"}), F_RSP|F_ERR, {})
+            return (mkframe(MT["ERROR"], F_RSP|F_ERR,
+                {"STATUS": 401, "MESSAGE": "no auth"}), F_RSP|F_ERR, {})
         if self.sessions[sid]["exp"] < time.time():
             del self.sessions[sid]
-            return (mkframe(MT["ERROR"], F_RSP|F_ERR, {"STATUS": 401, "MESSAGE": "expired"}), F_RSP|F_ERR, {})
+            return (mkframe(MT["ERROR"], F_RSP|F_ERR,
+                {"STATUS": 401, "MESSAGE": "expired"}), F_RSP|F_ERR, {})
 
         path = p.get("PATH", "")
         action = {MT["LIST"]:"list", MT["GET"]:"list", MT["CREATE"]:"create",
@@ -162,30 +206,36 @@ class SpotServer:
 
         if path in ("", "/menus"):
             return (mkframe(t, F_RSP, {"DATA": MENUS, "COUNT": len(MENUS), "STATUS": 0}), F_RSP, {})
-
         if path in ("/system/info", "/system/identity"):
             return (mkframe(t, F_RSP, {"DATA": self._sysinfo(), "STATUS": 0}), F_RSP, {})
 
-        k = path.strip("/").replace("/", "_")
-        if not k: k = "root"
-        f = self._dir / f"{k}.json"
-        items = json.loads(f.read_text()) if f.exists() else []
+        k = path.strip("/").replace("/", "_") or "root"
+        fp = self._dir / f"{k}.json"
+        items = json.loads(fp.read_text()) if fp.exists() else []
 
         if action == "list":
             return (mkframe(t, F_RSP, {"DATA": items, "COUNT": len(items), "STATUS": 0}), F_RSP, {})
         elif action == "create":
-            d = p.get("DATA", {}); d[".id"] = f"*{len(items)+1}"
-            items.append(d); f.write_text(json.dumps(items, indent=2))
+            d = dict(p.get("DATA", {}))
+            d[".id"] = f"*{len(items)+1}"
+            items.append(d)
+            fp.write_text(json.dumps(items, indent=2))
             return (mkframe(t, F_RSP, {"DATA": d, "COUNT": 1, "STATUS": 0, "MESSAGE": "created"}), F_RSP, {})
         elif action == "update":
             d = p.get("DATA", {}); iid = d.get(".id", "")
             for i, it in enumerate(items):
-                if it.get(".id") == iid: items[i].update(d); f.write_text(json.dumps(items, indent=2)); return (mkframe(t, F_RSP, {"DATA": items[i], "STATUS": 0}), F_RSP, {})
+                if it.get(".id") == iid:
+                    items[i].update(d)
+                    fp.write_text(json.dumps(items, indent=2))
+                    return (mkframe(t, F_RSP, {"DATA": items[i], "STATUS": 0}), F_RSP, {})
             return (mkframe(t, F_RSP, {"STATUS": 404, "MESSAGE": "not found"}), F_RSP, {})
         elif action == "delete":
             d = p.get("DATA", {}); iid = d.get(".id", "")
             for i, it in enumerate(items):
-                if it.get(".id") == iid: items.pop(i); f.write_text(json.dumps(items, indent=2)); return (mkframe(t, F_RSP, {"STATUS": 0}), F_RSP, {})
+                if it.get(".id") == iid:
+                    items.pop(i)
+                    fp.write_text(json.dumps(items, indent=2))
+                    return (mkframe(t, F_RSP, {"STATUS": 0}), F_RSP, {})
             return (mkframe(t, F_RSP, {"STATUS": 404, "MESSAGE": "not found"}), F_RSP, {})
 
         return (mkframe(t, F_RSP, {"DATA": [], "STATUS": 0}), F_RSP, {})
@@ -196,14 +246,16 @@ class SpotServer:
         cl, mt, mf = 23, 512.0, 128.0
         try:
             with open("/proc/loadavg") as f:
-                cl = int(float(f.read().split()[0]) * 100 / 4)
+                parts = f.read().split()
+                if parts: cl = int(float(parts[0]) * 100 / os.cpu_count() or 4)
             with open("/proc/meminfo") as f:
                 for l in f:
                     if l.startswith("MemTotal:"): mt = int(l.split()[1])/1024
                     elif l.startswith("MemAvailable:"): mf = int(l.split()[1])/1024
         except: pass
         return {"identity":"alpine","version":"3.23","uptime":f"{d}d{h}h{m}m",
-                "cpu-load":str(min(cl,100)),"free-memory":f"{mf:.0f}MiB","total-memory":f"{mt:.0f}MiB"}
+                "cpu-load":str(min(cl,100)),"free-memory":f"{mf:.0f}MiB",
+                "total-memory":f"{mt:.0f}MiB"}
 
 MENUS = [
     {"name":"Dashboard","containers":[{"title":"Dashboard"}]},
