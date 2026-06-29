@@ -4,7 +4,7 @@ Backend binario SP para Alpine Linux.
 Un solo archivo Python, sin dependencias. Protocolo binario sobre TCP.
 
 ```
-spot (cliente) ── TCP :1801 ──► spot-server.py (Alpine)
+Spot (Rust/egui) ── TCP :1801 ──► spot-server.py (Alpine)
 ```
 
 ## Instalar
