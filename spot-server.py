@@ -68,7 +68,7 @@ def dec_val(t, d, o):
         c = struct.unpack(">H", d[o:o+2])[0]; o += 2; r = {}
         for _ in range(c):
             f = d[o]; o += 1
-            if f == 0: k = d[o]; o += 1; n = K_R.get(k, f"k{k}")
+            if f == 0: k = d[o]; o += 1; n = K_R.get(k, f"k{k}").lower()
             else: l = struct.unpack(">H", d[o:o+2])[0]; o += 2; n = d[o:o+l].decode(); o += l
             t = d[o]; o += 1; v, o = dec_val(t, d, o); r[n] = v
         return (r, o)
@@ -217,6 +217,8 @@ class SpotServer:
             return (mkframe(t, F_RSP, {"DATA": items, "COUNT": len(items), "STATUS": 0}), F_RSP, {})
         elif action == "create":
             d = dict(p.get("DATA", {}))
+            # Normalizar keys a lowercase
+            d = {k.lower(): v for k, v in d.items()}
             d[".id"] = f"*{len(items)+1}"
             items.append(d)
             fp.write_text(json.dumps(items, indent=2))
